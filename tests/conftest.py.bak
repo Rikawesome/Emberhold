@@ -1,0 +1,120 @@
+"""Test DB fixtures.
+
+Requires a separate test database — don't point this at your real dev DB, since
+create_all/drop_all wipes everything. Set TEST_DATABASE_URL in your environment or
+.env, e.g.:
+
+    TEST_DATABASE_URL=postgresql+asyncpg://longdimming:longdimming@localhost:5432/longdimming_test
+
+Each test runs inside a transaction that's rolled back at the end, so tests never
+leak state into each other — you don't need to manually clean up between tests.
+"""
+
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+
+from app.core.db import Base
+from app.models.kingdom import Kingdom, World
+from app.models.march import March
+from app.models.player import Bloodline
+from app.models.tile import Tile, TileGarrison
+from app.models.troop import TroopType
+
+TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql+asyncpg://longdimming:longdimming@localhost:5432/longdimming_test"
+)
+
+
+@pytest_asyncio.fixture(scope="session")
+async def engine():
+    eng = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield eng
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def session(engine) -> AsyncSession:
+    async_session = async_sessionmaker(bind=engine, expire_on_commit=False)
+    async with async_session() as sess:
+        yield sess
+
+    async with engine.begin() as conn:
+        for table in reversed(Base.metadata.sorted_tables):
+            await conn.execute(table.delete())
+
+
+# ---------- factory helpers for building test data quickly ----------
+
+async def make_world(session: AsyncSession) -> World:
+    world = World(name="Test World")
+    session.add(world)
+    await session.flush()
+    return world
+
+
+async def make_bloodline(session: AsyncSession, key: str = "kindled") -> Bloodline:
+    bloodline = Bloodline(
+        key=key, name=key.title(), resonance_type="emberdust",
+        strength_desc="test", weakness_desc="test",
+    )
+    session.add(bloodline)
+    await session.flush()
+    return bloodline
+
+
+async def make_tile(session: AsyncSession, world_id: uuid.UUID, x: int = 0, y: int = 0, owner_kingdom_id=None) -> Tile:
+    tile = Tile(world_id=world_id, x=x, y=y, terrain_type="plain", base_yield={}, owner_kingdom_id=owner_kingdom_id)
+    session.add(tile)
+    await session.flush()
+    return tile
+
+
+async def make_kingdom(session: AsyncSession, world_id: uuid.UUID, bloodline_id: uuid.UUID, player_id=None) -> Kingdom:
+    kingdom = Kingdom(
+        player_id=player_id or uuid.uuid4(),
+        world_id=world_id, bloodline_id=bloodline_id, name="Test Hold",
+        kindling_shield_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),  # already expired by default
+    )
+    session.add(kingdom)
+    await session.flush()
+    return kingdom
+
+
+async def make_troop_type(session: AsyncSession, bloodline_id: uuid.UUID | None = None, key: str = "test_troop") -> TroopType:
+    troop = TroopType(
+        bloodline_id=bloodline_id, key=key, name=key.title(), tier="basic",
+        stats={"attack": 1, "defense": 1}, resource_costs={},
+    )
+    session.add(troop)
+    await session.flush()
+    return troop
+
+
+async def make_garrison(session: AsyncSession, tile_id, kingdom_id, troop_type_id, quantity: int) -> TileGarrison:
+    garrison = TileGarrison(tile_id=tile_id, kingdom_id=kingdom_id, troop_type_id=troop_type_id, quantity=quantity)
+    session.add(garrison)
+    await session.flush()
+    return garrison
+
+
+async def make_march(session: AsyncSession, world_id, kingdom_id, origin_tile_id, target_tile_id, quantity: int, troop_type_id) -> March:
+    march = March(
+        world_id=world_id, kingdom_id=kingdom_id, origin_tile_id=origin_tile_id, target_tile_id=target_tile_id,
+        troop_stack=[{"troop_type_id": str(troop_type_id), "quantity": quantity}],
+        march_type="attack",
+        departure_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        arrival_at=datetime.now(timezone.utc),  # already arrived, ready to resolve
+        status="marching",
+    )
+    session.add(march)
+    await session.flush()
+    return march
