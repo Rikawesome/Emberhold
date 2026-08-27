@@ -126,14 +126,17 @@ async def make_kingdom(session: AsyncSession, world_id: uuid.UUID, bloodline_id:
     return kingdom
 
 
-async def make_troop_type(session: AsyncSession, bloodline_id: uuid.UUID | None = None, key: str | None = None) -> TroopType:
+async def make_troop_type(
+    session: AsyncSession, bloodline_id: uuid.UUID | None = None, key: str | None = None,
+    stats: dict | None = None, ability_key: str | None = None,
+) -> TroopType:
     # Use a unique key if none is provided to avoid overlapping test failures
     if key is None:
         key = f"troop_{uuid.uuid4().hex[:12]}"
-        
+
     troop = TroopType(
         bloodline_id=bloodline_id, key=key, name=key.title().replace("_", " "), tier="basic",
-        stats={"attack": 1, "defense": 1}, resource_costs={},
+        stats=stats or {"attack": 1, "defense": 1}, ability_key=ability_key, resource_costs={},
     )
     session.add(troop)
     await session.flush()

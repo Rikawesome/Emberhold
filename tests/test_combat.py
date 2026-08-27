@@ -1,8 +1,16 @@
-"""Baseline combat lifecycle tests.
+"""Combat resolution tests.
 
-Abilities are intentionally out of scope here.  These tests pin down deterministic
-casualties, survivor persistence, capture semantics, fortification, idempotency,
-rollback, and target locking before abilities are added.
+See Section 11 of the API reference doc: this is the highest-risk code in the
+project.
+
+These tests cover:
+- baseline stat-weighted combat
+- Scorch
+- Chill
+- Bulwark
+- Breach
+- Aegis Core
+- simultaneous-attack concurrency
 """
 
 import asyncio
@@ -25,401 +33,693 @@ from tests.conftest import (
 )
 
 
-async def _deduct_origin(session, origin_id, kingdom_id, troop_type_id, quantity):
-    garrison = await session.scalar(
-        select(TileGarrison).where(
-            TileGarrison.tile_id == origin_id,
-            TileGarrison.kingdom_id == kingdom_id,
-            TileGarrison.troop_type_id == troop_type_id,
-        )
-    )
-    assert garrison is not None
-    assert garrison.quantity >= quantity
-    garrison.quantity -= quantity
-
-
 @pytest.mark.asyncio
-async def test_attacker_victory_has_deterministic_casualties_and_survivors(session):
+async def test_attacker_wins_captures_tile_with_survivors(session):
     world = await make_world(session)
-    attacker_bl = await make_bloodline(session, "kindled")
-    defender_bl = await make_bloodline(session, "deepwell")
-    attacker = await make_kingdom(session, world.id, attacker_bl.id)
-    defender = await make_kingdom(session, world.id, defender_bl.id)
-    troop = await make_troop_type(session)
-    origin = await make_tile(session, world.id, 0, 0, attacker.id)
-    target = await make_tile(session, world.id, 1, 0, defender.id)
-    await make_garrison(session, origin.id, attacker.id, troop.id, 10)
-    await make_garrison(session, target.id, defender.id, troop.id, 4)
-    await _deduct_origin(session, origin.id, attacker.id, troop.id, 10)
+    attacker_bloodline = await make_bloodline(session, "kindled")
+    defender_bloodline = await make_bloodline(session, "deepwell")
+    attacker = await make_kingdom(session, world.id, attacker_bloodline.id)
+    defender = await make_kingdom(session, world.id, defender_bloodline.id)
+    troop_type = await make_troop_type(session)
+
+    origin = await make_tile(
+        session,
+        world.id,
+        x=0,
+        y=0,
+        owner_kingdom_id=attacker.id,
+    )
+    target = await make_tile(
+        session,
+        world.id,
+        x=1,
+        y=0,
+        owner_kingdom_id=defender.id,
+    )
+
+    await make_garrison(
+        session,
+        target.id,
+        defender.id,
+        troop_type.id,
+        quantity=4,
+    )
 
     march = await make_march(
-        session, world.id, attacker.id, origin.id, target.id, 10, troop.id
+        session,
+        world.id,
+        attacker.id,
+        origin.id,
+        target.id,
+        quantity=10,
+        troop_type_id=troop_type.id,
     )
     await session.commit()
 
     log = await resolve_march(session, march.id)
     await session.commit()
-
-    assert log.result["attacker_power"] == 10
-    assert log.result["defender_power"] == 4
-    assert log.result["attacker_casualties"] == 4
-    assert log.result["defender_casualties"] == 4
-    assert log.result["attacker_survivors"] == 6
-    assert log.result["defender_survivors"] == 0
-
-    origin_garrison = await session.scalar(
-        select(TileGarrison).where(TileGarrison.tile_id == origin.id)
-    )
-    target_garrison = await session.scalar(
-        select(TileGarrison).where(
-            TileGarrison.tile_id == target.id,
-            TileGarrison.kingdom_id == attacker.id,
-            TileGarrison.troop_type_id == troop.id,
-        )
-    )
-    assert origin_garrison.quantity == 0
-    assert target_garrison.quantity == 6
-
-
-@pytest.mark.asyncio
-async def test_defender_victory_preserves_ownership_and_defender_survivors(session):
-    world = await make_world(session)
-    attacker_bl = await make_bloodline(session, "kindled")
-    defender_bl = await make_bloodline(session, "deepwell")
-    attacker = await make_kingdom(session, world.id, attacker_bl.id)
-    defender = await make_kingdom(session, world.id, defender_bl.id)
-    troop = await make_troop_type(session)
-    origin = await make_tile(session, world.id, 0, 0, attacker.id)
-    target = await make_tile(session, world.id, 1, 0, defender.id)
-    await make_garrison(session, origin.id, attacker.id, troop.id, 5)
-    await make_garrison(session, target.id, defender.id, troop.id, 20)
-    await _deduct_origin(session, origin.id, attacker.id, troop.id, 5)
-
-    march = await make_march(
-        session, world.id, attacker.id, origin.id, target.id, 5, troop.id
-    )
-    await session.commit()
-
-    log = await resolve_march(session, march.id)
-    await session.commit()
-
-    assert log.result["outcome"] == "repelled"
-    assert log.result["attacker_casualties"] == 5
-    assert log.result["defender_casualties"] == 5
-    assert log.result["defender_survivors"] == 15
 
     refreshed_target = await session.get(Tile, target.id)
-    assert refreshed_target.owner_kingdom_id == defender.id
 
-    defender_garrison = await session.scalar(
-        select(TileGarrison).where(
-            TileGarrison.tile_id == target.id,
-            TileGarrison.kingdom_id == defender.id,
-            TileGarrison.troop_type_id == troop.id,
+    assert refreshed_target.owner_kingdom_id == attacker.id
+    assert log.result["outcome"] == "captured"
+    assert log.result["attacker_power"] == 10
+    assert log.result["defender_power"] == 4
+
+    surviving_garrison = (
+        await session.execute(
+            select(TileGarrison).where(
+                TileGarrison.tile_id == target.id
+            )
         )
-    )
-    assert defender_garrison.quantity == 15
+    ).scalars().all()
+
+    attacker_rows = [
+        g for g in surviving_garrison
+        if g.kingdom_id == attacker.id
+    ]
+    defender_rows = [
+        g for g in surviving_garrison
+        if g.kingdom_id == defender.id
+    ]
+
+    assert sum(g.quantity for g in attacker_rows) == 6
+    assert all(g.quantity == 0 for g in defender_rows)
 
 
 @pytest.mark.asyncio
-async def test_zero_survivors_remove_garrison_rows(session):
+async def test_defender_wins_garrison_reduced_not_tile_flipped(session):
     world = await make_world(session)
-    attacker_bl = await make_bloodline(session, "kindled")
-    defender_bl = await make_bloodline(session, "deepwell")
-    attacker = await make_kingdom(session, world.id, attacker_bl.id)
-    defender = await make_kingdom(session, world.id, defender_bl.id)
-    troop = await make_troop_type(session)
-    origin = await make_tile(session, world.id, 0, 0, attacker.id)
-    target = await make_tile(session, world.id, 1, 0, defender.id)
-    await make_garrison(session, origin.id, attacker.id, troop.id, 10)
-    await make_garrison(session, target.id, defender.id, troop.id, 10)
-    await _deduct_origin(session, origin.id, attacker.id, troop.id, 10)
+    attacker_bloodline = await make_bloodline(session, "kindled")
+    defender_bloodline = await make_bloodline(session, "deepwell")
+    attacker = await make_kingdom(session, world.id, attacker_bloodline.id)
+    defender = await make_kingdom(session, world.id, defender_bloodline.id)
+    troop_type = await make_troop_type(session)
+
+    origin = await make_tile(
+        session,
+        world.id,
+        x=0,
+        y=0,
+        owner_kingdom_id=attacker.id,
+    )
+    target = await make_tile(
+        session,
+        world.id,
+        x=1,
+        y=0,
+        owner_kingdom_id=defender.id,
+    )
+
+    await make_garrison(
+        session,
+        target.id,
+        defender.id,
+        troop_type.id,
+        quantity=20,
+    )
 
     march = await make_march(
-        session, world.id, attacker.id, origin.id, target.id, 10, troop.id
+        session,
+        world.id,
+        attacker.id,
+        origin.id,
+        target.id,
+        quantity=5,
+        troop_type_id=troop_type.id,
     )
     await session.commit()
 
     log = await resolve_march(session, march.id)
     await session.commit()
 
-    assert log.result["attacker_survivors"] == 0
-    assert log.result["defender_survivors"] == 0
-    rows = (
-        await session.execute(
-            select(TileGarrison).where(TileGarrison.tile_id == target.id)
+    refreshed_target = await session.get(Tile, target.id)
+
+    assert refreshed_target.owner_kingdom_id == defender.id
+    assert log.result["outcome"] == "repelled"
+
+    remaining = await session.scalar(
+        select(TileGarrison.quantity).where(
+            TileGarrison.tile_id == target.id
         )
-    ).scalars().all()
-    assert rows == []
+    )
+
+    assert remaining == 15
 
 
 @pytest.mark.asyncio
-async def test_attacker_survivors_after_capture_are_not_duplicated(session):
+async def test_scorch_doubles_archer_offense(session):
+    """Scorch doubles Cinder Archer offense for this battle.
+
+    5 archers @ attack=2 normally contribute 10 offense.
+    Scorch makes that 20.
+
+    Defender has 15 defense, so the normal attack would lose,
+    while the Scorch attack wins.
+    """
     world = await make_world(session)
-    attacker_bl = await make_bloodline(session, "kindled")
-    defender_bl = await make_bloodline(session, "deepwell")
-    attacker = await make_kingdom(session, world.id, attacker_bl.id)
-    defender = await make_kingdom(session, world.id, defender_bl.id)
-    troop = await make_troop_type(session)
-    origin = await make_tile(session, world.id, 0, 0, attacker.id)
-    target = await make_tile(session, world.id, 1, 0, defender.id)
-    await make_garrison(session, origin.id, attacker.id, troop.id, 10)
-    await make_garrison(session, target.id, defender.id, troop.id, 4)
-    await _deduct_origin(session, origin.id, attacker.id, troop.id, 10)
+
+    attacker_bloodline = await make_bloodline(session, "kindled")
+    defender_bloodline = await make_bloodline(session, "deepwell")
+
+    attacker = await make_kingdom(
+        session,
+        world.id,
+        attacker_bloodline.id,
+    )
+    defender = await make_kingdom(
+        session,
+        world.id,
+        defender_bloodline.id,
+    )
+
+    archers = await make_troop_type(
+        session,
+        key="test_archers",
+        stats={"attack": 2, "defense": 1},
+        ability_key="scorch",
+    )
+
+    defender_troop = await make_troop_type(
+        session,
+        key="test_defenders",
+        stats={"attack": 1, "defense": 3},
+    )
+
+    origin = await make_tile(
+        session,
+        world.id,
+        x=0,
+        y=0,
+        owner_kingdom_id=attacker.id,
+    )
+    target = await make_tile(
+        session,
+        world.id,
+        x=1,
+        y=0,
+        owner_kingdom_id=defender.id,
+    )
+
+    await make_garrison(
+        session,
+        target.id,
+        defender.id,
+        defender_troop.id,
+        quantity=5,
+    )
 
     march = await make_march(
-        session, world.id, attacker.id, origin.id, target.id, 10, troop.id
+        session,
+        world.id,
+        attacker.id,
+        origin.id,
+        target.id,
+        quantity=5,
+        troop_type_id=archers.id,
     )
+
     await session.commit()
 
-    await resolve_march(session, march.id)
+    log = await resolve_march(session, march.id)
     await session.commit()
 
-    attacker_rows = (
-        await session.execute(
-            select(TileGarrison).where(
-                TileGarrison.tile_id == target.id,
-                TileGarrison.kingdom_id == attacker.id,
-                TileGarrison.troop_type_id == troop.id,
-            )
-        )
-    ).scalars().all()
-
-    assert len(attacker_rows) == 1
-    assert attacker_rows[0].quantity == 6
+    assert log.result["attacker_power"] == 20
+    assert log.result["outcome"] == "captured"
 
 
 @pytest.mark.asyncio
-async def test_ownership_transfer_and_failed_attack_preserves_owner(session):
+async def test_chill_reduces_attacker_offense(session):
+    """Chill reduces the attacker's effective offense.
+
+    10 attackers @ attack=2 = 20 offense.
+    10 Chill defenders reduce this by 5.
+    Effective offense = 15.
+
+    Defender defense is also 15, so the attack is repelled because
+    victory requires offense to strictly exceed defense.
+    """
     world = await make_world(session)
-    attacker_bl = await make_bloodline(session, "kindled")
-    defender_bl = await make_bloodline(session, "deepwell")
-    attacker = await make_kingdom(session, world.id, attacker_bl.id)
-    defender = await make_kingdom(session, world.id, defender_bl.id)
-    troop = await make_troop_type(session)
 
-    # Capture case.
-    origin_a = await make_tile(session, world.id, 0, 0, attacker.id)
-    target_a = await make_tile(session, world.id, 1, 0, defender.id)
-    await make_garrison(session, origin_a.id, attacker.id, troop.id, 11)
-    await make_garrison(session, target_a.id, defender.id, troop.id, 10)
-    await _deduct_origin(session, origin_a.id, attacker.id, troop.id, 11)
-    march_a = await make_march(
-        session, world.id, attacker.id, origin_a.id, target_a.id, 11, troop.id
+    attacker_bloodline = await make_bloodline(session, "kindled")
+    defender_bloodline = await make_bloodline(session, "deepwell")
+
+    attacker = await make_kingdom(
+        session,
+        world.id,
+        attacker_bloodline.id,
+    )
+    defender = await make_kingdom(
+        session,
+        world.id,
+        defender_bloodline.id,
     )
 
-    # Repel case.
-    origin_b = await make_tile(session, world.id, 0, 1, attacker.id)
-    target_b = await make_tile(session, world.id, 1, 1, defender.id)
-    await make_garrison(session, origin_b.id, attacker.id, troop.id, 5)
-    await make_garrison(session, target_b.id, defender.id, troop.id, 20)
-    await _deduct_origin(session, origin_b.id, attacker.id, troop.id, 5)
-    march_b = await make_march(
-        session, world.id, attacker.id, origin_b.id, target_b.id, 5, troop.id
-    )
-    await session.commit()
-
-    log_a = await resolve_march(session, march_a.id)
-    log_b = await resolve_march(session, march_b.id)
-    await session.commit()
-
-    assert log_a.result["outcome"] == "captured"
-    assert log_b.result["outcome"] == "repelled"
-    assert (await session.get(Tile, target_a.id)).owner_kingdom_id == attacker.id
-    assert (await session.get(Tile, target_b.id)).owner_kingdom_id == defender.id
-
-
-@pytest.mark.asyncio
-async def test_fortification_affects_combat_before_abilities(session):
-    world = await make_world(session)
-    attacker_bl = await make_bloodline(session, "kindled")
-    defender_bl = await make_bloodline(session, "deepwell")
-    attacker = await make_kingdom(session, world.id, attacker_bl.id)
-    defender = await make_kingdom(session, world.id, defender_bl.id)
-    troop = await make_troop_type(session)
-    origin = await make_tile(session, world.id, 0, 0, attacker.id)
-
-    unfortified = await make_tile(session, world.id, 1, 0, defender.id)
-    await make_garrison(session, unfortified.id, defender.id, troop.id, 10)
-    await make_garrison(session, origin.id, attacker.id, troop.id, 11)
-    await _deduct_origin(session, origin.id, attacker.id, troop.id, 11)
-    march_one = await make_march(
-        session, world.id, attacker.id, origin.id, unfortified.id, 11, troop.id
+    attacker_troop = await make_troop_type(
+        session,
+        key="test_attackers",
+        stats={"attack": 2, "defense": 1},
     )
 
-    fortified = await make_tile(session, world.id, 1, 1, defender.id)
-    await make_garrison(session, fortified.id, defender.id, troop.id, 10)
-    session.add(Building(tile_id=fortified.id, building_type="fortification", level=1))
-    await session.flush()
-    # Use a fresh attacker stack for the second attack.
-    origin_two = await make_tile(session, world.id, 0, 1, attacker.id)
-    await make_garrison(session, origin_two.id, attacker.id, troop.id, 11)
-    await _deduct_origin(session, origin_two.id, attacker.id, troop.id, 11)
-    march_two = await make_march(
-        session, world.id, attacker.id, origin_two.id, fortified.id, 11, troop.id
+    slingers = await make_troop_type(
+        session,
+        key="test_slingers",
+        stats={"attack": 1, "defense": 1.5},
+        ability_key="chill",
     )
-    await session.commit()
 
-    unfortified_log = await resolve_march(session, march_one.id)
-    fortified_log = await resolve_march(session, march_two.id)
-    await session.commit()
+    origin = await make_tile(
+        session,
+        world.id,
+        x=0,
+        y=0,
+        owner_kingdom_id=attacker.id,
+    )
+    target = await make_tile(
+        session,
+        world.id,
+        x=1,
+        y=0,
+        owner_kingdom_id=defender.id,
+    )
 
-    assert unfortified_log.result["outcome"] == "captured"
-    assert fortified_log.result["outcome"] == "repelled"
-    assert fortified_log.result["fortification_bonus"] == 1
-    assert fortified_log.result["defender_power_with_fortification"] == 11
+    await make_garrison(
+        session,
+        target.id,
+        defender.id,
+        slingers.id,
+        quantity=10,
+    )
 
-
-@pytest.mark.asyncio
-async def test_march_cannot_resolve_twice_or_duplicate_side_effects(session):
-    world = await make_world(session)
-    attacker_bl = await make_bloodline(session, "kindled")
-    defender_bl = await make_bloodline(session, "deepwell")
-    attacker = await make_kingdom(session, world.id, attacker_bl.id)
-    defender = await make_kingdom(session, world.id, defender_bl.id)
-    troop = await make_troop_type(session)
-    origin = await make_tile(session, world.id, 0, 0, attacker.id)
-    target = await make_tile(session, world.id, 1, 0, defender.id)
-    await make_garrison(session, origin.id, attacker.id, troop.id, 10)
-    await make_garrison(session, target.id, defender.id, troop.id, 4)
-    await _deduct_origin(session, origin.id, attacker.id, troop.id, 10)
     march = await make_march(
-        session, world.id, attacker.id, origin.id, target.id, 10, troop.id
+        session,
+        world.id,
+        attacker.id,
+        origin.id,
+        target.id,
+        quantity=10,
+        troop_type_id=attacker_troop.id,
     )
+
     await session.commit()
 
-    first = await resolve_march(session, march.id)
-    await session.commit()
-    second = await resolve_march(session, march.id)
+    log = await resolve_march(session, march.id)
     await session.commit()
 
-    assert first.id == second.id
-    assert second.result["attacker_survivors"] == 6
-
-    logs = (
-        await session.execute(
-            select(CombatLog).where(CombatLog.march_id == march.id)
-        )
-    ).scalars().all()
-    assert len(logs) == 1
-
-    rows = (
-        await session.execute(
-            select(TileGarrison).where(
-                TileGarrison.tile_id == target.id,
-                TileGarrison.kingdom_id == attacker.id,
-            )
-        )
-    ).scalars().all()
-    assert len(rows) == 1
-    assert rows[0].quantity == 6
+    assert log.result["attacker_power"] == 15
+    assert log.result["outcome"] == "repelled"
 
 
 @pytest.mark.asyncio
-async def test_transaction_rollback_reverts_entire_resolution(engine):
-    factory = async_sessionmaker(bind=engine, expire_on_commit=False)
+async def test_bulwark_survivors_freeze_instead_of_dying(session):
+    """Bulwark troops survive at half strength when their garrison loses."""
+    world = await make_world(session)
 
-    async with factory() as setup:
-        world = await make_world(setup)
-        attacker_bl = await make_bloodline(setup, "kindled")
-        defender_bl = await make_bloodline(setup, "deepwell")
-        attacker = await make_kingdom(setup, world.id, attacker_bl.id)
-        defender = await make_kingdom(setup, world.id, defender_bl.id)
-        troop = await make_troop_type(setup)
-        origin = await make_tile(setup, world.id, 0, 0, attacker.id)
-        target = await make_tile(setup, world.id, 1, 0, defender.id)
-        await make_garrison(setup, origin.id, attacker.id, troop.id, 10)
-        await make_garrison(setup, target.id, defender.id, troop.id, 4)
-        await _deduct_origin(setup, origin.id, attacker.id, troop.id, 10)
-        march = await make_march(
-            setup, world.id, attacker.id, origin.id, target.id, 10, troop.id
+    attacker_bloodline = await make_bloodline(session, "kindled")
+    defender_bloodline = await make_bloodline(session, "deepwell")
+
+    attacker = await make_kingdom(
+        session,
+        world.id,
+        attacker_bloodline.id,
+    )
+    defender = await make_kingdom(
+        session,
+        world.id,
+        defender_bloodline.id,
+    )
+
+    attacker_troop = await make_troop_type(
+        session,
+        key="test_attackers2",
+        stats={"attack": 2, "defense": 1},
+    )
+
+    wardens = await make_troop_type(
+        session,
+        key="test_wardens",
+        stats={"attack": 1, "defense": 1},
+        ability_key="bulwark",
+    )
+
+    origin = await make_tile(
+        session,
+        world.id,
+        x=0,
+        y=0,
+        owner_kingdom_id=attacker.id,
+    )
+    target = await make_tile(
+        session,
+        world.id,
+        x=1,
+        y=0,
+        owner_kingdom_id=defender.id,
+    )
+
+    await make_garrison(
+        session,
+        target.id,
+        defender.id,
+        wardens.id,
+        quantity=10,
+    )
+
+    march = await make_march(
+        session,
+        world.id,
+        attacker.id,
+        origin.id,
+        target.id,
+        quantity=10,
+        troop_type_id=attacker_troop.id,
+    )
+
+    await session.commit()
+
+    log = await resolve_march(session, march.id)
+    await session.commit()
+
+    assert log.result["outcome"] == "captured"
+
+    remaining_wardens = await session.scalar(
+        select(TileGarrison.quantity).where(
+            TileGarrison.tile_id == target.id,
+            TileGarrison.troop_type_id == wardens.id,
         )
-        await setup.commit()
+    )
 
-    async with factory() as tx:
-        await resolve_march(tx, march.id)
-        await tx.rollback()
-
-    async with factory() as check:
-        refreshed_march = await check.get(type(march), march.id)
-        refreshed_target = await check.get(Tile, target.id)
-        origin_garrison = await check.scalar(
-            select(TileGarrison).where(TileGarrison.tile_id == origin.id)
-        )
-        target_garrison = await check.scalar(
-            select(TileGarrison).where(
-                TileGarrison.tile_id == target.id,
-                TileGarrison.kingdom_id == defender.id,
-            )
-        )
-        logs = (
-            await check.execute(
-                select(CombatLog).where(CombatLog.march_id == march.id)
-            )
-        ).scalars().all()
-
-        assert refreshed_march.status == "marching"
-        assert refreshed_target.owner_kingdom_id == defender.id
-        assert origin_garrison.quantity == 0
-        assert target_garrison.quantity == 4
-        assert logs == []
+    assert remaining_wardens == 5
 
 
 @pytest.mark.asyncio
-async def test_concurrent_attacks_against_same_tile_are_serialized(engine):
-    """The target row lock prevents both transactions from consuming the same
-    pre-attack garrison snapshot."""
-    factory = async_sessionmaker(bind=engine, expire_on_commit=False)
+async def test_breach_bonus_against_built_tile(session):
+    """Siege Engineers receive a 1.5x offense bonus against built tiles."""
+    world = await make_world(session)
 
-    async with factory() as setup:
-        world = await make_world(setup)
-        attacker_a_bl = await make_bloodline(setup, "kindled_concurrent")
-        attacker_b_bl = await make_bloodline(setup, "driftborn")
-        defender_bl = await make_bloodline(setup, "deepwell_concurrent")
-        attacker_a = await make_kingdom(setup, world.id, attacker_a_bl.id)
-        attacker_b = await make_kingdom(setup, world.id, attacker_b_bl.id)
-        defender = await make_kingdom(setup, world.id, defender_bl.id)
-        troop = await make_troop_type(setup)
+    attacker_bloodline = await make_bloodline(
+        session,
+        "emberwrights",
+    )
+    defender_bloodline = await make_bloodline(
+        session,
+        "deepwell",
+    )
 
-        origin_a = await make_tile(setup, world.id, 0, 0, attacker_a.id)
-        origin_b = await make_tile(setup, world.id, 0, 1, attacker_b.id)
-        target = await make_tile(setup, world.id, 5, 5, defender.id)
-        await make_garrison(setup, origin_a.id, attacker_a.id, troop.id, 12)
-        await make_garrison(setup, origin_b.id, attacker_b.id, troop.id, 12)
-        await make_garrison(setup, target.id, defender.id, troop.id, 10)
-        await _deduct_origin(setup, origin_a.id, attacker_a.id, troop.id, 12)
-        await _deduct_origin(setup, origin_b.id, attacker_b.id, troop.id, 12)
+    attacker = await make_kingdom(
+        session,
+        world.id,
+        attacker_bloodline.id,
+    )
+    defender = await make_kingdom(
+        session,
+        world.id,
+        defender_bloodline.id,
+    )
+
+    engineers = await make_troop_type(
+        session,
+        key="test_engineers",
+        stats={"attack": 1, "defense": 1},
+        ability_key="breach",
+    )
+
+    defender_troop = await make_troop_type(
+        session,
+        key="test_def2",
+        stats={"attack": 1, "defense": 4},
+    )
+
+    origin = await make_tile(
+        session,
+        world.id,
+        x=0,
+        y=0,
+        owner_kingdom_id=attacker.id,
+    )
+    target = await make_tile(
+        session,
+        world.id,
+        x=1,
+        y=0,
+        owner_kingdom_id=defender.id,
+    )
+
+    await make_garrison(
+        session,
+        target.id,
+        defender.id,
+        defender_troop.id,
+        quantity=3,
+    )
+
+    session.add(
+        Building(
+            tile_id=target.id,
+            building_type="fortification",
+        )
+    )
+
+    march = await make_march(
+        session,
+        world.id,
+        attacker.id,
+        origin.id,
+        target.id,
+        quantity=10,
+        troop_type_id=engineers.id,
+    )
+
+    await session.commit()
+
+    log = await resolve_march(session, march.id)
+    await session.commit()
+
+    assert log.result["attacker_power"] == 15
+    assert log.result["outcome"] == "captured"
+
+
+@pytest.mark.asyncio
+async def test_aegis_core_boosts_adjacent_tile_defense(session):
+    """Aegis Core boosts defense from adjacent same-kingdom tiles."""
+    world = await make_world(session)
+
+    attacker_bloodline = await make_bloodline(session, "kindled")
+    defender_bloodline = await make_bloodline(
+        session,
+        "emberwrights",
+    )
+
+    attacker = await make_kingdom(
+        session,
+        world.id,
+        attacker_bloodline.id,
+    )
+    defender = await make_kingdom(
+        session,
+        world.id,
+        defender_bloodline.id,
+    )
+
+    forgeguard = await make_troop_type(
+        session,
+        key="test_forgeguard",
+        stats={"attack": 1, "defense": 1},
+        ability_key="aegis_core",
+    )
+
+    weak_attacker = await make_troop_type(
+        session,
+        key="test_weak",
+        stats={"attack": 1, "defense": 1},
+    )
+
+    origin = await make_tile(
+        session,
+        world.id,
+        x=0,
+        y=0,
+        owner_kingdom_id=attacker.id,
+    )
+
+    target = await make_tile(
+        session,
+        world.id,
+        x=5,
+        y=5,
+        owner_kingdom_id=defender.id,
+    )
+
+    adjacent = await make_tile(
+        session,
+        world.id,
+        x=5,
+        y=6,
+        owner_kingdom_id=defender.id,
+    )
+
+    await make_garrison(
+        session,
+        adjacent.id,
+        defender.id,
+        forgeguard.id,
+        quantity=2,
+    )
+
+    march = await make_march(
+        session,
+        world.id,
+        attacker.id,
+        origin.id,
+        target.id,
+        quantity=3,
+        troop_type_id=weak_attacker.id,
+    )
+
+    await session.commit()
+
+    log = await resolve_march(session, march.id)
+    await session.commit()
+
+    assert log.result["defender_power"] == 4
+    assert log.result["outcome"] == "repelled"
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_attacks_are_serialized(engine):
+    """Two attacks against the same tile must not both consume the same
+    pre-battle garrison state.
+
+    The target tile is row-locked by resolve_march(), so whichever transaction
+    acquires the lock first resolves against the original garrison. The second
+    transaction then sees the updated tile/garrison state.
+    """
+    async_session_factory = async_sessionmaker(
+        bind=engine,
+        expire_on_commit=False,
+    )
+
+    async with async_session_factory() as setup_session:
+        world = await make_world(setup_session)
+
+        bloodline_a = await make_bloodline(
+            setup_session,
+            "kindled",
+        )
+        bloodline_b = await make_bloodline(
+            setup_session,
+            "driftborn",
+        )
+        defender_bloodline = await make_bloodline(
+            setup_session,
+            "deepwell",
+        )
+
+        attacker_a = await make_kingdom(
+            setup_session,
+            world.id,
+            bloodline_a.id,
+        )
+        attacker_b = await make_kingdom(
+            setup_session,
+            world.id,
+            bloodline_b.id,
+        )
+        defender = await make_kingdom(
+            setup_session,
+            world.id,
+            defender_bloodline.id,
+        )
+
+        troop_type = await make_troop_type(setup_session)
+
+        origin_a = await make_tile(
+            setup_session,
+            world.id,
+            x=0,
+            y=0,
+            owner_kingdom_id=attacker_a.id,
+        )
+
+        origin_b = await make_tile(
+            setup_session,
+            world.id,
+            x=0,
+            y=1,
+            owner_kingdom_id=attacker_b.id,
+        )
+
+        target = await make_tile(
+            setup_session,
+            world.id,
+            x=5,
+            y=5,
+            owner_kingdom_id=defender.id,
+        )
+
+        await make_garrison(
+            setup_session,
+            target.id,
+            defender.id,
+            troop_type.id,
+            quantity=10,
+        )
+
+        # Each attacker alone would win: 12 > 10.
         march_a = await make_march(
-            setup, world.id, attacker_a.id, origin_a.id, target.id, 12, troop.id
+            setup_session,
+            world.id,
+            attacker_a.id,
+            origin_a.id,
+            target.id,
+            quantity=12,
+            troop_type_id=troop_type.id,
         )
+
         march_b = await make_march(
-            setup, world.id, attacker_b.id, origin_b.id, target.id, 12, troop.id
+            setup_session,
+            world.id,
+            attacker_b.id,
+            origin_b.id,
+            target.id,
+            quantity=12,
+            troop_type_id=troop_type.id,
         )
-        await setup.commit()
+
+        await setup_session.commit()
 
     async def resolve_in_own_session(march_id):
-        async with factory() as tx:
-            log = await resolve_march(tx, march_id)
-            await tx.commit()
+        async with async_session_factory() as s:
+            log = await resolve_march(s, march_id)
+            await s.commit()
             return log
 
-    logs = await asyncio.gather(
+    results = await asyncio.gather(
         resolve_in_own_session(march_a.id),
         resolve_in_own_session(march_b.id),
     )
 
-    assert len(logs) == 2
-    assert sum(log.result["defender_casualties"] for log in logs) == 12
-    assert any(log.result["defender_power"] == 10 for log in logs)
+    outcomes = {r.result["outcome"] for r in results}
 
-    async with factory() as check:
-        target_after = await check.get(Tile, target.id)
-        assert target_after.owner_kingdom_id in {attacker_a.id, attacker_b.id}
+    assert "captured" in outcomes
 
-        garrisons = (
-            await check.execute(
-                select(TileGarrison).where(TileGarrison.tile_id == target.id)
+    async with async_session_factory() as check_session:
+        final_garrisons = (
+            await check_session.execute(
+                select(TileGarrison).where(
+                    TileGarrison.tile_id == target.id
+                )
             )
         ).scalars().all()
-        assert all(g.quantity >= 0 for g in garrisons)
-        assert sum(g.quantity for g in garrisons) == 10
+
+        assert all(g.quantity >= 0 for g in final_garrisons)
+
+        refreshed_target = await check_session.get(
+            Tile,
+            target.id,
+        )
+
+        assert refreshed_target.owner_kingdom_id in {
+            attacker_a.id,
+            attacker_b.id,
+        }

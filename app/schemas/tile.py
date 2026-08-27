@@ -11,7 +11,8 @@ class TileResponse(BaseModel):
     terrain_type: str
     resonance_affinity: str | None
     owner_kingdom_id: uuid.UUID | None
-    garrison_summary: int  # a count only — full breakdown is owner/Wardens-scout only
+    garrison_summary: int  # a count only — everyone sees this
+    garrison_breakdown: dict[str, int] | None = None  # per-troop-type counts — owner/Wardens only
 
 
 class TileListResponse(BaseModel):

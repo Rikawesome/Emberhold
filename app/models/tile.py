@@ -1,7 +1,16 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Integer, ForeignKey, DateTime, func
+from sqlalchemy import (
+    String,
+    Integer,
+    ForeignKey,
+    DateTime,
+    func,
+    UniqueConstraint,
+    Index,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -40,19 +49,57 @@ class TileGarrison(Base):
 class Building(Base):
     __tablename__ = "buildings"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tiles.id"))
+    __table_args__ = (
+        UniqueConstraint(
+            "tile_id",
+            name="uq_buildings_tile_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    tile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tiles.id"),
+    )
     building_type: Mapped[str] = mapped_column(String(32))
     level: Mapped[int] = mapped_column(Integer, default=1)
-    built_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
+    built_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
 
 class BuildingQueue(Base):
     __tablename__ = "building_queue"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tiles.id"))
+    __table_args__ = (
+        Index(
+            "uq_building_queue_active_tile",
+            "tile_id",
+            unique=True,
+            postgresql_where=text("status = 'in_progress'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    tile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tiles.id"),
+    )
     building_type: Mapped[str] = mapped_column(String(32))
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
     completes_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    status: Mapped[str] = mapped_column(String(16), default="in_progress")  # in_progress | complete
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default="in_progress",
+    )

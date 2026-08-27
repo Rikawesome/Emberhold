@@ -8,7 +8,12 @@ in config for this) so events broadcast across processes.
 
 import uuid
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import async_session
+from app.core.security import decode_access_token
+from app.models.kingdom import Kingdom
 
 router = APIRouter(tags=["websocket"])
 
@@ -16,9 +21,19 @@ _connections: dict[uuid.UUID, list[WebSocket]] = {}
 
 
 @router.websocket("/ws/kingdoms/{kingdom_id}")
-async def kingdom_events(websocket: WebSocket, kingdom_id: uuid.UUID):
-    # TODO: authenticate the connection (token as a query param or first message)
-    # before accepting — this scaffold accepts unconditionally.
+async def kingdom_events(websocket: WebSocket, kingdom_id: uuid.UUID, token: str = Query(...)):
+    player_id_str = decode_access_token(token)
+    if player_id_str is None:
+        await websocket.close(code=4401)  # unauthorized — private code range, not a standard close code
+        return
+
+    async with async_session() as session:  # type: AsyncSession
+        kingdom = await session.get(Kingdom, kingdom_id)
+
+    if kingdom is None or str(kingdom.player_id) != player_id_str:
+        await websocket.close(code=4403)  # forbidden — this token doesn't own this kingdom
+        return
+
     await websocket.accept()
     _connections.setdefault(kingdom_id, []).append(websocket)
     try:
