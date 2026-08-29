@@ -55,7 +55,7 @@ async def train_troops(
         quantity=payload.quantity, started_at=now, completes_at=completes_at,
     )
     session.add(entry)
-    await session.commit()
+    await session.flush()
 
     return TrainingQueueEntry(
         queue_id=entry.id, tile_id=tile_id, troop_type=troop_type.key,

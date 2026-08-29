@@ -58,21 +58,41 @@ from typing import AsyncIterator # Add this import at the top of your file if it
 
 @pytest_asyncio.fixture
 async def session(engine) -> AsyncIterator[AsyncSession]:
-    connection = await engine.connect()
-    transaction = await connection.begin()
-    async_session = async_sessionmaker(bind=connection, expire_on_commit=False)
+    async def clean_database():
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("""
+                    DO $$
+                    DECLARE
+                        r RECORD;
+                    BEGIN
+                        FOR r IN (
+                            SELECT tablename
+                            FROM pg_tables
+                            WHERE schemaname = 'public'
+                        )
+                        LOOP
+                            EXECUTE 'TRUNCATE TABLE public.' ||
+                                    quote_ident(r.tablename) ||
+                                    ' CASCADE';
+                        END LOOP;
+                    END $$;
+                """)
+            )
+
+    # Guarantee a clean database before every test.
+    await clean_database()
+
+    async_session = async_sessionmaker(bind=engine, expire_on_commit=False)
     sess = async_session()
 
-    yield sess
+    try:
+        yield sess
+    finally:
+        await sess.close()
 
-    await sess.close()
-    await transaction.rollback()
-    await connection.close()
-
-
-
-# ---------- factory helpers for building test data quickly ----------
-
+        # Also clean after every test.
+        await clean_database()
 async def make_world(session: AsyncSession) -> World:
     world = World(name="Test World")
     session.add(world)
@@ -127,21 +147,28 @@ async def make_kingdom(session: AsyncSession, world_id: uuid.UUID, bloodline_id:
 
 
 async def make_troop_type(
-    session: AsyncSession, bloodline_id: uuid.UUID | None = None, key: str | None = None,
-    stats: dict | None = None, ability_key: str | None = None,
+    session: AsyncSession,
+    bloodline_id: uuid.UUID | None = None,
+    key: str | None = None,
+    stats: dict | None = None,
+    ability_key: str | None = None,
+    resource_costs: dict | None = None,
 ) -> TroopType:
-    # Use a unique key if none is provided to avoid overlapping test failures
     if key is None:
         key = f"troop_{uuid.uuid4().hex[:12]}"
 
     troop = TroopType(
-        bloodline_id=bloodline_id, key=key, name=key.title().replace("_", " "), tier="basic",
-        stats=stats or {"attack": 1, "defense": 1}, ability_key=ability_key, resource_costs={},
+        bloodline_id=bloodline_id,
+        key=key,
+        name=key.title().replace("_", " "),
+        tier="basic",
+        stats=stats or {"attack": 1, "defense": 1},
+        ability_key=ability_key,
+        resource_costs=resource_costs or {},
     )
     session.add(troop)
     await session.flush()
     return troop
-
 
 async def make_garrison(session: AsyncSession, tile_id, kingdom_id, troop_type_id, quantity: int) -> TileGarrison:
     garrison = TileGarrison(tile_id=tile_id, kingdom_id=kingdom_id, troop_type_id=troop_type_id, quantity=quantity)
