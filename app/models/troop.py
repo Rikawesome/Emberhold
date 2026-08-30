@@ -36,3 +36,9 @@ class TrainingQueue(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completes_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(16), default="in_progress")  # in_progress | complete
+
+class TroopQueue(TrainingQueue):
+    """Backward compatible alias for TrainingQueue used in older tests.
+    Inherit all fields and behavior unchanged.
+    """
+    pass

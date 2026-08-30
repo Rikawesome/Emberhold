@@ -39,6 +39,15 @@ class Tile(Base):
 class TileGarrison(Base):
     __tablename__ = "tile_garrisons"
 
+    __table_args__ = (
+        UniqueConstraint(
+            "tile_id",
+            "kingdom_id",
+            "troop_type_id",
+            name="uq_tile_garrison_tile_kingdom_troop",
+        ),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tiles.id"))
     kingdom_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("kingdoms.id"))

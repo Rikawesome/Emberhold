@@ -1,5 +1,6 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -13,7 +14,6 @@ from app.models.tile import Tile, TileGarrison
 from app.models.troop import TroopType
 from app.schemas.march import MarchRequest, MarchResponse, MarchStatusEntry
 from app.services import marches as march_service
-
 
 router = APIRouter(
     prefix="/kingdoms/{kingdom_id}/marches",
@@ -36,6 +36,13 @@ async def create_march(
             detail="Not your kingdom",
         )
 
+    # Validate march_type
+    if payload.march_type not in ["attack", "reinforce", "return"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid march type: {payload.march_type}",
+        )
+
     origin = await session.get(Tile, payload.origin_tile_id)
     target = await session.get(Tile, payload.target_tile_id)
 
@@ -49,6 +56,19 @@ async def create_march(
         raise HTTPException(
             status_code=404,
             detail="Target tile not found",
+        )
+
+    # Target relationship validation
+    if payload.march_type == "attack" and target.owner_kingdom_id == kingdom_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot attack your own territory",
+        )
+        
+    if payload.march_type == "reinforce" and target.owner_kingdom_id != kingdom_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reinforce territory you do not own",
         )
 
     if await march_service.check_kindling_shield(target, session):
@@ -90,6 +110,10 @@ async def create_march(
 
         # Deduct troops from garrison.
         garrison.quantity -= entry.quantity
+        
+        # Clean up the garrison row if the stack is fully depleted.
+        if garrison.quantity == 0:
+            await session.delete(garrison)
 
     # Determine whether the march contains a Stormrunner.
     troop_type_ids = {
@@ -110,14 +134,24 @@ async def create_march(
         for troop_type in troop_types
     )
 
+    now = datetime.now(timezone.utc)
+
+    if has_flash_march:
+        if kingdom.flash_march_available_at and now < kingdom.flash_march_available_at:
+            raise HTTPException(
+                status_code=400,
+                detail="Flash March is on cooldown",
+            )
+        kingdom.flash_march_available_at = now + timedelta(hours=1)
+
     travel_time = march_service.calculate_travel_time(
         origin,
         target,
         has_flash_march=has_flash_march,
     )
 
-    now = datetime.now(timezone.utc)
     arrival_at = now + travel_time
+
 
     march = March(
         world_id=kingdom.world_id,

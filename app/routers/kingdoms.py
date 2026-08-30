@@ -48,16 +48,18 @@ async def get_kingdom_public(
     player_id: uuid.UUID = Depends(get_current_player_id),
     session: AsyncSession = Depends(get_session),
 ):
-    """Public view. TODO: respect Wardens intel bonus for the requester (garrison
-    visibility) and strip private queue details that /me includes.
-    """
+    """Public view. Strips private resource stockpile details unless requested by owner."""
     kingdom = await session.get(Kingdom, kingdom_id)
     if kingdom is None:
         raise HTTPException(status_code=404, detail="Kingdom not found")
 
     bloodline = await session.get(Bloodline, kingdom.bloodline_id)
-    resources = await production.collect_all(session, kingdom.id)
-    await session.commit()
+    
+    if kingdom.player_id == player_id:
+        resources = await production.collect_all(session, kingdom.id)
+        await session.commit()
+    else:
+        resources = {}
 
     return KingdomResponse(
         id=kingdom.id,
@@ -68,3 +70,27 @@ async def get_kingdom_public(
         kindling_shield_expires_at=kingdom.kindling_shield_expires_at,
         resources=resources,
     )
+
+
+@router.get("/{kingdom_id}/tech")
+async def get_kingdom_tech(
+    kingdom_id: uuid.UUID,
+    player_id: uuid.UUID = Depends(get_current_player_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Retrieve self-mitigation tech option for the kingdom's bloodline."""
+    from app.data.bloodlines import SELF_MITIGATION
+
+    kingdom = await session.get(Kingdom, kingdom_id)
+    if kingdom is None or kingdom.player_id != player_id:
+        raise HTTPException(status_code=403, detail="Not your kingdom")
+
+    bloodline = await session.get(Bloodline, kingdom.bloodline_id)
+    tech = SELF_MITIGATION.get(bloodline.key, {})
+
+    return {
+        "bloodline": bloodline.key,
+        "self_mitigation": tech,
+    }
+
+

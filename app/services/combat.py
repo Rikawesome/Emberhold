@@ -27,9 +27,11 @@ from typing import Dict, List
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.kingdom import Kingdom
 from app.models.march import CombatLog, March
 from app.models.tile import Building, Tile, TileGarrison
 from app.models.troop import TroopType
+
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +270,11 @@ async def _aegis_core_defense_bonus(
 async def resolve_march(
     session: AsyncSession,
     march_id: uuid.UUID,
-) -> CombatLog:
-    """Resolve one attack exactly once.
+) -> CombatLog | None:
+    """Resolve a march based on its type exactly once.
 
     The march row is locked before checking its status. The target tile and its
-    garrisons are then locked before combat calculations.
+    garrisons are then locked before calculations.
 
     No commit occurs here. The caller owns the transaction boundary.
     """
@@ -293,6 +295,9 @@ async def resolve_march(
 
     if march.status != "marching":
         if march.status == "resolved":
+            if march.march_type in ("reinforce", "return"):
+                return None
+
             existing_log = await _get_existing_combat_log(
                 session,
                 march.id,
@@ -306,7 +311,58 @@ async def resolve_march(
         )
 
     # -----------------------------------------------------------------------
-    # Lock target tile.
+    # Route non-combat march lifecycles (Reinforce / Return)
+    # -----------------------------------------------------------------------
+    if march.march_type in ("reinforce", "return"):
+        destination_tile_id = march.target_tile_id
+
+
+        target_tile = await session.scalar(
+            select(Tile)
+            .where(Tile.id == destination_tile_id)
+            .with_for_update()
+        )
+
+        if target_tile is None:
+            raise ValueError(
+                f"Destination tile {destination_tile_id} not found"
+            )
+
+        for entry in march.troop_stack:
+            troop_type_id = uuid.UUID(str(entry["troop_type_id"]))
+            quantity = max(0, int(entry["quantity"]))
+
+            if quantity <= 0:
+                continue
+
+            existing = await session.scalar(
+                select(TileGarrison)
+                .where(
+                    TileGarrison.tile_id == target_tile.id,
+                    TileGarrison.kingdom_id == march.kingdom_id,
+                    TileGarrison.troop_type_id == troop_type_id,
+                )
+                .with_for_update()
+            )
+
+            if existing:
+                existing.quantity += quantity
+            else:
+                session.add(
+                    TileGarrison(
+                        tile_id=target_tile.id,
+                        kingdom_id=march.kingdom_id,
+                        troop_type_id=troop_type_id,
+                        quantity=quantity,
+                    )
+                )
+
+        march.status = "resolved"
+        march.version += 1
+        return None
+
+    # -----------------------------------------------------------------------
+    # Lock target tile for Combat (Attack)
     # -----------------------------------------------------------------------
     target_tile = await session.scalar(
         select(Tile)
@@ -533,14 +589,7 @@ async def resolve_march(
     # Casualties.
     # -----------------------------------------------------------------------
     if attacker_wins:
-        # Preserve baseline proportional casualty distribution.
-        #
-        # Use the effective attacker battle power so Scorch/Breach correctly
-        # influence the attacker's casualty ratio.
-        attacker_power_for_casualties = sum(
-            troop["effective_power"]
-            for troop in attacker_troops
-        )
+        attacker_power_for_casualties = attacker_offense
 
         if attacker_power_for_casualties <= 0:
             attacker_casualties = [
@@ -561,8 +610,6 @@ async def resolve_march(
                 for troop in attacker_troops
             ]
 
-        # Normally all defending troops are removed on capture.
-        # Bulwark is the exception.
         defender_casualties = []
 
         for troop in defender_troops:
@@ -580,17 +627,26 @@ async def resolve_march(
             defender_casualties.append(casualty_qty)
 
     else:
-        # Losing attackers are completely lost, as in the baseline.
         attacker_casualties = [
             troop["qty"]
             for troop in attacker_troops
         ]
 
-        defender_casualties = calculate_stack_casualties(
-            defender_troops,
-            "defense",
-            int(attacker_offense),
-        )
+        if defender_defense_with_abilities <= 0:
+            defender_casualties = [
+                troop["qty"]
+                for troop in defender_troops
+            ]
+        else:
+            defender_casualties = [
+                calculate_casualties(
+                    quantity=troop["qty"],
+                    own_power=int(defender_defense_with_abilities),
+                    opposing_power=int(attacker_offense),
+                )
+                for troop in defender_troops
+            ]
+
 
     # -----------------------------------------------------------------------
     # Calculate survivors.
@@ -624,12 +680,9 @@ async def resolve_march(
         target_tile.owner_kingdom_id = march.kingdom_id
         target_tile.version += 1
 
-        # The defeated kingdom's garrison rows cannot remain as enemy troops
-        # after ownership changes.
         for garrison in defender_garrisons:
             await session.delete(garrison)
 
-        # Add attacker survivors to the captured tile.
         for troop, survivor_qty in zip(
             attacker_troops,
             attacker_survivors,
@@ -660,89 +713,88 @@ async def resolve_march(
                     )
                 )
 
-        # Bulwark survivors are retained as frozen defenders.
-        #
-        # They remain represented on the captured tile, but because the old
-        # kingdom's garrison rows were deleted above, they need to be inserted
-        # explicitly under the new tile ownership.
+        bulwark_retreat_stack = []
+        for troop, survivor_qty in zip(defender_troops, defender_survivors):
+            if troop["ability_key"] == "bulwark" and survivor_qty > 0:
+                bulwark_retreat_stack.append({
+                    "troop_type_id": str(troop["troop_type_id"]),
+                    "quantity": survivor_qty,
+                })
+
+        if bulwark_retreat_stack and defender_kingdom_id:
+            defender_kingdom = await session.get(Kingdom, defender_kingdom_id)
+            if defender_kingdom and defender_kingdom.capital_tile_id:
+                now = datetime.now(timezone.utc)
+                retreat_march = March(
+                    world_id=target_tile.world_id,
+                    kingdom_id=defender_kingdom_id,
+                    origin_tile_id=target_tile.id,
+                    target_tile_id=defender_kingdom.capital_tile_id,
+                    troop_stack=bulwark_retreat_stack,
+                    march_type="return",
+                    departure_at=now,
+                    arrival_at=now,
+                    status="marching",
+                )
+                session.add(retreat_march)
+                await session.flush()
+                await resolve_march(session, retreat_march.id)
+
+
+        outcome = "captured"
+        from app.services import production
+        await production.recalculate_production(session, march.kingdom_id)
+        if defender_kingdom_id is not None:
+            await production.recalculate_production(session, defender_kingdom_id)
+
+
+    elif attacker_wins:
+        # Attacked an already-owned tile: reinforcement/victory without capture.
+        for troop, survivor_qty in zip(
+            attacker_troops,
+            attacker_survivors,
+        ):
+            if survivor_qty <= 0:
+                continue
+
+            existing = await session.scalar(
+                select(TileGarrison)
+                .where(
+                    TileGarrison.tile_id == target_tile.id,
+                    TileGarrison.kingdom_id == march.kingdom_id,
+                    TileGarrison.troop_type_id
+                    == troop["troop_type_id"],
+                )
+                .with_for_update()
+            )
+
+            if existing:
+                existing.quantity += survivor_qty
+            else:
+                session.add(
+                    TileGarrison(
+                        tile_id=target_tile.id,
+                        kingdom_id=march.kingdom_id,
+                        troop_type_id=troop["troop_type_id"],
+                        quantity=survivor_qty,
+                    )
+                )
+
+        # Apply calculated casualties to existing defender garrisons (Fix 1)
         for troop, survivor_qty in zip(
             defender_troops,
             defender_survivors,
         ):
-            if (
-                troop["ability_key"] != "bulwark"
-                or survivor_qty <= 0
-            ):
-                continue
+            garrison = troop["garrison"]
 
-            existing = await session.scalar(
-                select(TileGarrison)
-                .where(
-                    TileGarrison.tile_id == target_tile.id,
-                    TileGarrison.kingdom_id == march.kingdom_id,
-                    TileGarrison.troop_type_id
-                    == troop["troop_type_id"],
-                )
-                .with_for_update()
-            )
-
-            if existing:
-                existing.quantity += survivor_qty
+            if survivor_qty > 0:
+                garrison.quantity = survivor_qty
             else:
-                session.add(
-                    TileGarrison(
-                        tile_id=target_tile.id,
-                        kingdom_id=march.kingdom_id,
-                        troop_type_id=troop["troop_type_id"],
-                        quantity=survivor_qty,
-                    )
-                )
+                await session.delete(garrison)
 
-        outcome = "captured"
-
-    elif attacker_wins:
-        # Attacker defeated no opposing kingdom because the tile is already
-        # owned by the attacker. Preserve the baseline behavior: no ownership
-        # transfer and no deletion of the existing garrison.
-        #
-        # Add surviving attacking troops to the existing friendly garrison.
-        for troop, survivor_qty in zip(
-            attacker_troops,
-            attacker_survivors,
-        ):
-            if survivor_qty <= 0:
-                continue
-
-            existing = await session.scalar(
-                select(TileGarrison)
-                .where(
-                    TileGarrison.tile_id == target_tile.id,
-                    TileGarrison.kingdom_id == march.kingdom_id,
-                    TileGarrison.troop_type_id
-                    == troop["troop_type_id"],
-                )
-                .with_for_update()
-            )
-
-            if existing:
-                existing.quantity += survivor_qty
-            else:
-                session.add(
-                    TileGarrison(
-                        tile_id=target_tile.id,
-                        kingdom_id=march.kingdom_id,
-                        troop_type_id=troop["troop_type_id"],
-                        quantity=survivor_qty,
-                    )
-                )
-
-        # Keep the existing owner's garrison and report the successful battle.
-        outcome = "captured"
+        outcome = "victorious"
 
     else:
-        # Failed attacks preserve ownership.
-        #
-        # Update surviving defender stacks and remove zero-quantity rows.
         for troop, survivor_qty in zip(
             defender_troops,
             defender_survivors,

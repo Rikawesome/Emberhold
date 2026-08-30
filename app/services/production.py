@@ -160,3 +160,81 @@ async def spend(
     # All resources are affordable, so deduction can safely happen.
     for resource_type, cost in costs.items():
         rows_by_type[resource_type].amount -= cost
+
+
+BUILDING_YIELD_BONUSES = {
+    "wellspring_tap": {"emberlight": 15},
+    "grove_farm": {"sustenance": 15},
+    "ashfield_works": {"scrap": 15},
+}
+
+BASE_KINGDOM_PRODUCTION = {
+    "emberlight": 10.0,
+    "sustenance": 10.0,
+    "scrap": 10.0,
+}
+
+
+async def recalculate_production(
+    session: AsyncSession,
+    kingdom_id: uuid.UUID,
+) -> dict[str, float]:
+    """Recalculates and updates rate_per_hour for all resource ledgers owned by a kingdom
+    based on territory base yields and built structures.
+    """
+    from app.models.tile import Building, Tile
+
+    tiles = (
+        await session.execute(
+            select(Tile).where(Tile.owner_kingdom_id == kingdom_id)
+        )
+    ).scalars().all()
+
+    rates: dict[str, float] = dict(BASE_KINGDOM_PRODUCTION)
+
+    if tiles:
+        tile_ids = [t.id for t in tiles]
+        for t in tiles:
+            if t.base_yield:
+                for res, yield_amt in t.base_yield.items():
+                    rates[res] = rates.get(res, 0.0) + float(yield_amt)
+
+        buildings = (
+            await session.execute(
+                select(Building).where(Building.tile_id.in_(tile_ids))
+            )
+        ).scalars().all()
+
+        for b in buildings:
+            bonuses = BUILDING_YIELD_BONUSES.get(b.building_type, {})
+            for res, bonus_amt in bonuses.items():
+                rates[res] = rates.get(res, 0.0) + float(bonus_amt) * float(b.level)
+
+    resources = (
+        await session.execute(
+            select(KingdomResource)
+            .where(KingdomResource.kingdom_id == kingdom_id)
+            .with_for_update()
+        )
+    ).scalars().all()
+
+    resource_map = {r.resource_type: r for r in resources}
+    now = _now()
+
+    for res_type, new_rate in rates.items():
+        if res_type in resource_map:
+            res_row = resource_map[res_type]
+            _materialize(res_row, now)
+            res_row.rate_per_hour = new_rate
+        else:
+            session.add(
+                KingdomResource(
+                    kingdom_id=kingdom_id,
+                    resource_type=res_type,
+                    amount=0.0,
+                    rate_per_hour=new_rate,
+                    last_collected_at=now,
+                )
+            )
+
+    return rates

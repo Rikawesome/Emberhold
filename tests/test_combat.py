@@ -349,6 +349,15 @@ async def test_bulwark_survivors_freeze_instead_of_dying(session):
         defender_bloodline.id,
     )
 
+    def_capital = await make_tile(
+        session,
+        world.id,
+        x=10,
+        y=10,
+        owner_kingdom_id=defender.id,
+    )
+    defender.capital_tile_id = def_capital.id
+
     attacker_troop = await make_troop_type(
         session,
         key="test_attackers2",
@@ -404,12 +413,13 @@ async def test_bulwark_survivors_freeze_instead_of_dying(session):
 
     remaining_wardens = await session.scalar(
         select(TileGarrison.quantity).where(
-            TileGarrison.tile_id == target.id,
+            TileGarrison.tile_id == def_capital.id,
             TileGarrison.troop_type_id == wardens.id,
         )
     )
 
     assert remaining_wardens == 5
+
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,13 @@
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_session
+from app.core.deps import get_current_player_id
 from app.core.security import create_access_token, hash_password, verify_password
+
 from app.models.player import Player
 from app.schemas.player import LoginRequest, RegisterRequest, RegisterResponse, TokenResponse
 from app.services import kingdoms as kingdom_service
@@ -41,3 +45,13 @@ async def login(payload: LoginRequest, session: AsyncSession = Depends(get_sessi
 
     token = create_access_token(subject=str(player.id))
     return TokenResponse(access_token=token)
+
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_token(
+    player_id: uuid.UUID = Depends(get_current_player_id),
+):
+    """Issue a fresh JWT token for an active session."""
+    token = create_access_token(subject=str(player_id))
+    return TokenResponse(access_token=token)
+

@@ -32,9 +32,11 @@ class Kingdom(Base):
     )
     founded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     kindling_shield_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    flash_march_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # optimistic concurrency — bump on every mutating write, check-and-increment in services/
     version: Mapped[int] = mapped_column(Integer, default=0)
+
 
 
 class KingdomResource(Base):
